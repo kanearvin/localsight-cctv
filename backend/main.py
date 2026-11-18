@@ -14,7 +14,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import db
-from config import workspace_dir
+from fastapi.staticfiles import StaticFiles
+
+from config import frontend_dist_dir, workspace_dir
 from events import VideoEvent, build_contact_sheets, cluster_into_events
 from ingest import (
     ensure_browser_mp4,
@@ -289,6 +291,17 @@ async def stream_playable_video(video_id: str):
     if not record or not Path(record["playable_mp4_path"]).exists():
         raise HTTPException(status_code=404, detail="Video not found.")
     return FileResponse(record["playable_mp4_path"], media_type="video/mp4")
+
+
+def mount_frontend(target: FastAPI, dist: Path) -> bool:
+    """Serve the built React app at / (after all /api routes) so a release runs from one command."""
+    if not (dist / "index.html").is_file():
+        return False
+    target.mount("/", StaticFiles(directory=str(dist), html=True), name="frontend")
+    return True
+
+
+mount_frontend(app, frontend_dist_dir())
 
 
 if __name__ == "__main__":

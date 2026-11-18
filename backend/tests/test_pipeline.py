@@ -394,3 +394,25 @@ def test_gemini_adapter_sends_key_in_header(tmp_path):
     assert "gemini-2.5-flash:generateContent" in seen["url"]
     assert seen["body"]["generationConfig"]["responseMimeType"] == "application/json"
     assert seen["body"]["contents"][0]["parts"][1]["inlineData"]["mimeType"] == "image/jpeg"
+
+
+# ---------------------------------------------------------------- bundled frontend
+
+def test_mount_frontend_serves_spa_without_shadowing_api(tmp_path):
+    from fastapi import FastAPI
+
+    dist = tmp_path / "dist"
+    assert main.mount_frontend(FastAPI(), dist) is False  # no build -> nothing mounted
+
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>LocalSight</title>")
+    app = FastAPI()
+
+    @app.get("/api/ping")
+    def ping():
+        return {"pong": True}
+
+    assert main.mount_frontend(app, dist) is True
+    with TestClient(app) as c:
+        assert "LocalSight" in c.get("/").text
+        assert c.get("/api/ping").json() == {"pong": True}

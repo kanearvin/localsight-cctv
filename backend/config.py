@@ -13,3 +13,8 @@ def workspace_dir() -> Path:
 
 def db_path() -> Path:
     return workspace_dir() / "localsight.db"
+
+
+def frontend_dist_dir() -> Path:
+    """Built frontend (npm run build). Served by the backend when present, for one-command launch."""
+    return Path(os.environ.get("LOCALSIGHT_FRONTEND_DIST", REPO_ROOT / "frontend" / "dist"))
