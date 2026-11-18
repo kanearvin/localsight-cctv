@@ -482,3 +482,213 @@ def test_ollama_uses_generous_timeout_and_keep_alive(tmp_path):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     asyncio.run(analyze_contact_sheet_ollama(str(img), "x", client=client))
     assert seen["body"]["model"] == "qwen2.5vl:3b" and seen["body"]["keep_alive"]
+
+
+# ---------------------------------------------------------------- OpenRouter / Cloudflare (OpenAI-compatible)
+
+from vlm_client import (  # noqa: E402
+    analyze_contact_sheet_cloudflare,
+    analyze_contact_sheet_openrouter,
+    filter_free_vision_models,
+)
+
+CF_ACCOUNT = "0123456789abcdef0123456789abcdef"
+
+
+def _sheet(tmp_path) -> str:
+    img = tmp_path / "s.jpg"
+    Image.new("RGB", (1440, 540)).save(img)
+    return str(img)
+
+
+def _chat_ok(content) -> httpx.Response:
+    return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": content}}]})
+
+
+def test_openrouter_adapter_request_shape(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(url=str(request.url), auth=request.headers.get("authorization"),
+                    title=request.headers.get("x-title"), body=json.loads(request.content))
+        return _chat_ok(VALID_JSON)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    res = asyncio.run(analyze_contact_sheet_openrouter(_sheet(tmp_path), "person", "or-key", client=client))
+    assert res.matched and res.best_timestamp == "00:00:05"
+    assert seen["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert seen["auth"] == "Bearer or-key" and "or-key" not in seen["url"]
+    body = seen["body"]
+    assert body["model"] == "google/gemma-4-26b-a4b-it:free"
+    assert body["response_format"] == {"type": "json_object"}
+    parts = body["messages"][1]["content"]
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_cloudflare_adapter_uses_account_scoped_openai_endpoint(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(url=str(request.url), auth=request.headers.get("authorization"), body=json.loads(request.content))
+        # Cloudflare / some gateways return content as a list of typed parts
+        return _chat_ok([{"type": "text", "text": f"Here you go: {VALID_JSON}"}])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    res = asyncio.run(analyze_contact_sheet_cloudflare(_sheet(tmp_path), "person", "cf-token", CF_ACCOUNT, client=client))
+    assert res.matched  # prose-wrapped JSON still parses
+    assert seen["url"] == f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/v1/chat/completions"
+    assert seen["auth"] == "Bearer cf-token"
+    assert seen["body"]["model"] == "@cf/meta/llama-4-scout-17b-16e-instruct"
+
+
+def test_openai_compatible_retries_on_429_then_succeeds(tmp_path, monkeypatch):
+    import vlm_client
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr(vlm_client.asyncio, "sleep", fake_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"retry-after": "3"}, json={"error": {"message": "Rate limit exceeded: free-models-per-min"}})
+        return _chat_ok(VALID_JSON)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    res = asyncio.run(analyze_contact_sheet_openrouter(_sheet(tmp_path), "x", "k", client=client))
+    assert res.matched and calls["n"] == 2 and sleeps == [3.0]
+
+
+def test_openai_compatible_surfaces_persistent_429_and_200_error_bodies(tmp_path, monkeypatch):
+    import vlm_client
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(vlm_client.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(429, json={"error": {"message": "Rate limit exceeded: free-models-per-day"}})))
+    with pytest.raises(vlm_client.VLMProviderError, match="429.*free-models-per-day"):
+        asyncio.run(analyze_contact_sheet_openrouter(_sheet(tmp_path), "x", "k", client=client))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"error": {"message": "Provider returned error", "code": 502}})))
+    with pytest.raises(vlm_client.VLMProviderError, match="Provider returned error"):
+        asyncio.run(analyze_contact_sheet_openrouter(_sheet(tmp_path), "x", "k", client=client))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: _chat_ok(None)))
+    with pytest.raises(vlm_client.VLMProviderError, match="empty response"):
+        asyncio.run(analyze_contact_sheet_openrouter(_sheet(tmp_path), "x", "k", client=client))
+
+
+def test_filter_free_vision_models():
+    models = [
+        {"id": "a/vision:free", "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
+         "supported_parameters": ["response_format"]},
+        {"id": "b/paid-vision", "pricing": {"prompt": "0.0000001", "completion": "0"},
+         "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]}},
+        {"id": "c/text-only:free", "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}},
+        {"id": "d/music:free", "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["audio"]}},
+        {"id": "e/nojson:free", "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"input_modalities": ["image", "text"], "output_modalities": ["text"]}},
+    ]
+    out = filter_free_vision_models(models)
+    assert [m["id"] for m in out] == ["a/vision:free", "e/nojson:free"]  # JSON-capable first
+    assert out[0]["json_mode"] is True and out[1]["json_mode"] is False
+
+
+def test_openrouter_models_endpoint_filters_and_caches(client, monkeypatch):
+    calls = {"n": 0}
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        def handler(request):
+            calls["n"] += 1
+            assert str(request.url) == "https://openrouter.ai/api/v1/models"
+            assert "authorization" not in request.headers  # public listing, no key sent
+            return httpx.Response(200, json={"data": [
+                {"id": "google/gemma-4-26b-a4b-it:free", "pricing": {"prompt": "0", "completion": "0"},
+                 "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
+                 "supported_parameters": ["response_format"]},
+            ]})
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", fake_client)
+    monkeypatch.setitem(main._OPENROUTER_CACHE, "models", [])
+    r1 = client.get("/api/openrouter/models").json()
+    r2 = client.get("/api/openrouter/models").json()
+    assert [m["id"] for m in r1["models"]] == ["google/gemma-4-26b-a4b-it:free"]
+    assert r1 == r2 and calls["n"] == 1  # second call served from cache
+
+
+@requires_ffmpeg
+def test_search_routes_to_openrouter_and_cloudflare(client, synthetic_video, monkeypatch):
+    vid = _index(client, synthetic_video).json()["video_id"]
+    seen: list[tuple] = []
+
+    async def fake_or(image_path, user_query, api_key, model="?", **_):
+        seen.append(("openrouter", api_key, model))
+        return EventSearchResult(matched=True, confidence=0.7, best_timestamp="", summary="or", tags=[])
+
+    async def fake_cf(image_path, user_query, api_key, account_id, model="?", **_):
+        seen.append(("cloudflare", api_key, account_id, model))
+        return EventSearchResult(matched=True, confidence=0.6, best_timestamp="", summary="cf", tags=[])
+
+    monkeypatch.setattr(main, "analyze_contact_sheet_openrouter", fake_or)
+    monkeypatch.setattr(main, "analyze_contact_sheet_cloudflare", fake_cf)
+
+    r = client.post("/api/search", json={"video_id": vid, "query": "car", "provider": "openrouter",
+                                         "api_key": "or-k", "openrouter_model": "nvidia/nemotron-3.5-super-vl:free"})
+    assert r.status_code == 200 and r.json()["results"][0]["summary"] == "or"
+    r = client.post("/api/search", json={"video_id": vid, "query": "car", "provider": "cloudflare", "api_key": "cf-t",
+                                         "cloudflare_account_id": CF_ACCOUNT,
+                                         "cloudflare_model": "@cf/mistralai/mistral-small-3.1-24b-instruct"})
+    assert r.status_code == 200 and r.json()["results"][0]["summary"] == "cf"
+    assert ("openrouter", "or-k", "nvidia/nemotron-3.5-super-vl:free") in seen
+    assert ("cloudflare", "cf-t", CF_ACCOUNT, "@cf/mistralai/mistral-small-3.1-24b-instruct") in seen
+
+
+@requires_ffmpeg
+def test_search_validates_cloud_credentials_and_ids(client, synthetic_video):
+    vid = _index(client, synthetic_video).json()["video_id"]
+    base = {"video_id": vid, "query": "car"}
+    assert client.post("/api/search", json={**base, "provider": "openrouter"}).status_code == 400
+    r = client.post("/api/search", json={**base, "provider": "cloudflare", "api_key": "t"})
+    assert r.status_code == 400 and "account ID" in r.json()["detail"]
+    # Account ID and model IDs are interpolated into URLs / bodies: reject anything odd.
+    for bad in ["../evil", "0123456789abcdef0123456789abcdeg", "short"]:
+        r = client.post("/api/search", json={**base, "provider": "cloudflare", "api_key": "t", "cloudflare_account_id": bad})
+        assert r.status_code == 422, bad
+    r = client.post("/api/search", json={**base, "provider": "cloudflare", "api_key": "t",
+                                         "cloudflare_account_id": CF_ACCOUNT, "cloudflare_model": "llama-no-prefix"})
+    assert r.status_code == 422
+    r = client.post("/api/search", json={**base, "provider": "openrouter", "api_key": "k", "openrouter_model": "no-slash"})
+    assert r.status_code == 422
+
+
+@requires_ffmpeg
+def test_search_redacts_cloud_keys_from_errors(client, synthetic_video, monkeypatch):
+    vid = _index(client, synthetic_video).json()["video_id"]
+
+    async def leaky(image_path, user_query, api_key, *a, **_):
+        raise RuntimeError(f"bad token {api_key}")
+
+    monkeypatch.setattr(main, "analyze_contact_sheet_openrouter", leaky)
+    r = client.post("/api/search", json={"video_id": vid, "query": "x", "provider": "openrouter", "api_key": "sk-or-SECRET"})
+    assert r.status_code == 200 and "sk-or-SECRET" not in r.text
+
+
+def test_cloudflare_style_error_list_is_surfaced(tmp_path):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(
+        401, json={"success": False, "errors": [{"code": 10000, "message": "Authentication error"}]})))
+    with pytest.raises(Exception, match="401: Authentication error"):
+        asyncio.run(analyze_contact_sheet_cloudflare(_sheet(tmp_path), "x", "t", CF_ACCOUNT, client=client))

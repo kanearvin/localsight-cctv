@@ -15,17 +15,57 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { ApiError, getHealth, getVideo, indexVideo, reindexVideo, resolveUrl, searchEvents } from './api';
-import type { HealthResponse, IndexResponse, Point, Provider, SecurityEvent } from './types';
+import {
+  ApiError,
+  getHealth,
+  getOpenRouterModels,
+  getVideo,
+  indexVideo,
+  reindexVideo,
+  resolveUrl,
+  searchEvents,
+} from './api';
+import type { CloudProvider, HealthResponse, IndexResponse, OpenRouterModel, Point, Provider, SecurityEvent } from './types';
 
-const GEMINI_KEY_STORAGE = 'localsight.geminiKey'; // sessionStorage only — never persisted to disk/backend
+// API keys / tokens / account IDs live in sessionStorage only — never persisted to disk or the backend.
+const KEY_STORAGE_PREFIX = 'localsight.key.';
+const CF_ACCOUNT_STORAGE = 'localsight.cfAccountId';
 const LAST_VIDEO_STORAGE = 'localsight.lastVideoId';
+const PROVIDER_STORAGE = 'localsight.provider';
 const OLLAMA_MODEL_STORAGE = 'localsight.ollamaModel';
 const GEMINI_MODEL_STORAGE = 'localsight.geminiModel';
+const OPENROUTER_MODEL_STORAGE = 'localsight.openrouterModel';
+const CLOUDFLARE_MODEL_STORAGE = 'localsight.cloudflareModel';
+
+const CLOUD_PROVIDERS: CloudProvider[] = ['gemini', 'openrouter', 'cloudflare'];
+const PROVIDER_INFO: Record<Provider, { label: string; keyLabel: string; keyHelp: string }> = {
+  ollama: { label: 'Offline Ollama', keyLabel: '', keyHelp: '' },
+  gemini: {
+    label: 'Cloud BYOK · Gemini',
+    keyLabel: 'Gemini API key',
+    keyHelp: 'Free key: aistudio.google.com/apikey',
+  },
+  openrouter: {
+    label: 'Cloud BYOK · OpenRouter (free models)',
+    keyLabel: 'OpenRouter API key',
+    keyHelp: 'Free key: openrouter.ai/keys — ":free" models cost nothing but are rate-limited',
+  },
+  cloudflare: {
+    label: 'Cloud BYOK · Cloudflare Workers AI',
+    keyLabel: 'Cloudflare API token',
+    keyHelp: 'Token with "Workers AI" permission: dash.cloudflare.com/profile/api-tokens (10k free Neurons/day)',
+  },
+};
 
 // Fallbacks used until /api/health responds; the backend is the source of truth.
 const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
 const FALLBACK_GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
+const DEFAULT_OPENROUTER_MODEL = 'google/gemma-4-26b-a4b-it:free';
+const FALLBACK_CLOUDFLARE_MODELS = [
+  '@cf/meta/llama-4-scout-17b-16e-instruct',
+  '@cf/mistralai/mistral-small-3.1-24b-instruct',
+  '@cf/google/gemma-3-12b-it',
+];
 const GEMINI_LABELS: Record<string, string> = {
   'gemini-3.5-flash-lite': 'Gemini 3.5 Flash-Lite (fast, low cost)',
   'gemini-4-hydrogen': 'Gemini 4 Hydrogen (more capable)',
@@ -58,14 +98,33 @@ export default function App() {
   const [roiPoints, setRoiPoints] = useState<Point[]>([]);
   const [appliedRoi, setAppliedRoi] = useState<Point[]>([]);
   const [query, setQuery] = useState<string>('');
-  const [provider, setProvider] = useState<Provider>('ollama');
+  const [provider, setProvider] = useState<Provider>(() => {
+    const p = safeStorage('local')?.getItem(PROVIDER_STORAGE);
+    return p === 'gemini' || p === 'openrouter' || p === 'cloudflare' ? p : 'ollama';
+  });
   const [ollamaModel, setOllamaModel] = useState<string>(
     () => safeStorage('local')?.getItem(OLLAMA_MODEL_STORAGE) ?? DEFAULT_OLLAMA_MODEL,
   );
   const [geminiModel, setGeminiModel] = useState<string>(
     () => safeStorage('local')?.getItem(GEMINI_MODEL_STORAGE) ?? FALLBACK_GEMINI_MODELS[0],
   );
-  const [apiKey, setApiKey] = useState<string>(() => safeStorage('session')?.getItem(GEMINI_KEY_STORAGE) ?? '');
+  const [openrouterModel, setOpenrouterModel] = useState<string>(
+    () => safeStorage('local')?.getItem(OPENROUTER_MODEL_STORAGE) ?? DEFAULT_OPENROUTER_MODEL,
+  );
+  const [cloudflareModel, setCloudflareModel] = useState<string>(
+    () => safeStorage('local')?.getItem(CLOUDFLARE_MODEL_STORAGE) ?? FALLBACK_CLOUDFLARE_MODELS[0],
+  );
+  const [openrouterModels, setOpenrouterModels] = useState<OpenRouterModel[] | null>(null);
+  const [keys, setKeys] = useState<Record<CloudProvider, string>>(() => {
+    const store = safeStorage('session');
+    const legacyGemini = store?.getItem('localsight.geminiKey') ?? ''; // pre-multi-provider key name
+    return {
+      gemini: store?.getItem(`${KEY_STORAGE_PREFIX}gemini`) ?? legacyGemini,
+      openrouter: store?.getItem(`${KEY_STORAGE_PREFIX}openrouter`) ?? '',
+      cloudflare: store?.getItem(`${KEY_STORAGE_PREFIX}cloudflare`) ?? '',
+    };
+  });
+  const [cfAccountId, setCfAccountId] = useState<string>(() => safeStorage('session')?.getItem(CF_ACCOUNT_STORAGE) ?? '');
   const [busy, setBusy] = useState<null | 'indexing' | 'rescanning' | 'searching'>(null);
   const [error, setError] = useState<string | null>(null);
   const [events, setEvents] = useState<SecurityEvent[]>([]);
@@ -85,6 +144,7 @@ export default function App() {
         setHealth(h);
         // Drop a remembered Gemini model the backend no longer offers (e.g. a retired ID).
         setGeminiModel((m) => (h.gemini_models.includes(m) ? m : h.default_gemini_model));
+        setCloudflareModel((m) => (h.cloudflare_models.includes(m) ? m : h.default_cloudflare_model));
       })
       .catch(() => setHealth(null));
     const lastId = safeStorage('local')?.getItem(LAST_VIDEO_STORAGE);
@@ -105,19 +165,46 @@ export default function App() {
 
   useEffect(() => {
     try {
-      safeStorage('local')?.setItem(OLLAMA_MODEL_STORAGE, ollamaModel);
-      safeStorage('local')?.setItem(GEMINI_MODEL_STORAGE, geminiModel);
+      const local = safeStorage('local');
+      local?.setItem(PROVIDER_STORAGE, provider);
+      local?.setItem(OLLAMA_MODEL_STORAGE, ollamaModel);
+      local?.setItem(GEMINI_MODEL_STORAGE, geminiModel);
+      local?.setItem(OPENROUTER_MODEL_STORAGE, openrouterModel);
+      local?.setItem(CLOUDFLARE_MODEL_STORAGE, cloudflareModel);
     } catch {
-      /* storage unavailable — model choice just won't be remembered */
+      /* storage unavailable — choices just won't be remembered */
     }
-  }, [ollamaModel, geminiModel]);
+  }, [provider, ollamaModel, geminiModel, openrouterModel, cloudflareModel]);
 
   useEffect(() => {
     const store = safeStorage('session');
     if (!store) return;
-    if (apiKey) store.setItem(GEMINI_KEY_STORAGE, apiKey);
-    else store.removeItem(GEMINI_KEY_STORAGE);
-  }, [apiKey]);
+    try {
+      for (const p of CLOUD_PROVIDERS) {
+        if (keys[p]) store.setItem(`${KEY_STORAGE_PREFIX}${p}`, keys[p]);
+        else store.removeItem(`${KEY_STORAGE_PREFIX}${p}`);
+      }
+      store.removeItem('localsight.geminiKey');
+      if (cfAccountId) store.setItem(CF_ACCOUNT_STORAGE, cfAccountId);
+      else store.removeItem(CF_ACCOUNT_STORAGE);
+    } catch {
+      /* storage unavailable — keys live only in memory for this tab */
+    }
+  }, [keys, cfAccountId]);
+
+  // Load OpenRouter's live free-vision model list the first time that provider is selected.
+  useEffect(() => {
+    if (provider !== 'openrouter' || openrouterModels !== null) return;
+    getOpenRouterModels()
+      .then((r) => {
+        setOpenrouterModels(r.models);
+        setOpenrouterModel((m) => (r.models.some((x) => x.id === m) ? m : r.default));
+      })
+      .catch((err) => {
+        setOpenrouterModels([]);
+        setError(errorMessage(err));
+      });
+  }, [provider, openrouterModels]);
 
   // ---- keep the SVG overlay aligned with the rendered video frame (object-contain letterboxing) ----
   const recomputeBox = useCallback(() => {
@@ -203,8 +290,15 @@ export default function App() {
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!videoId || !query.trim()) return;
-    if (provider === 'gemini' && !apiKey.trim()) {
-      setError('Enter your Gemini API key to use Cloud BYOK mode.');
+    const cloud = provider !== 'ollama';
+    const key = cloud ? keys[provider].trim() : '';
+    if (cloud && !key) {
+      setError(`Enter your ${PROVIDER_INFO[provider].keyLabel} to use ${PROVIDER_INFO[provider].label}.`);
+      return;
+    }
+    const accountId = cfAccountId.trim().toLowerCase();
+    if (provider === 'cloudflare' && !/^[a-f0-9]{32}$/.test(accountId)) {
+      setError('Enter your Cloudflare account ID (32 hex characters, shown in the dashboard sidebar).');
       return;
     }
     setError(null);
@@ -214,9 +308,12 @@ export default function App() {
         video_id: videoId,
         query: query.trim(),
         provider,
-        api_key: provider === 'gemini' ? apiKey.trim() : null,
+        api_key: cloud ? key : null,
         ollama_model: ollamaModel,
         gemini_model: geminiModel,
+        openrouter_model: openrouterModel,
+        cloudflare_model: cloudflareModel,
+        cloudflare_account_id: provider === 'cloudflare' ? accountId : null,
       });
       setEvents(data.results);
       setSearched(true);
@@ -251,6 +348,15 @@ export default function App() {
   const installedOllama = health?.ollama_models ?? [];
   const ollamaOptions = Array.from(new Set([DEFAULT_OLLAMA_MODEL, ...installedOllama, ollamaModel]));
   const geminiOptions = Array.from(new Set([...(health?.gemini_models ?? FALLBACK_GEMINI_MODELS), geminiModel]));
+  const cloudflareOptions = Array.from(
+    new Set([...(health?.cloudflare_models ?? FALLBACK_CLOUDFLARE_MODELS), cloudflareModel]),
+  );
+  const openrouterOptions: OpenRouterModel[] =
+    openrouterModels && openrouterModels.length > 0
+      ? openrouterModels
+      : [{ id: openrouterModel, name: openrouterModel, context_length: null, json_mode: true }];
+  const selectCls = 'bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 max-w-[16rem]';
+  const inputCls = 'bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 w-44';
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6 font-sans">
@@ -267,21 +373,20 @@ export default function App() {
 
         <div className="flex flex-wrap items-center gap-3">
           <HealthBadge health={health} />
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value as Provider)}
-            className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
-          >
-            <option value="ollama">Offline Ollama</option>
-            <option value="gemini">Cloud BYOK (Gemini)</option>
+          <select value={provider} onChange={(e) => setProvider(e.target.value as Provider)} className={selectCls}>
+            {(Object.keys(PROVIDER_INFO) as Provider[]).map((p) => (
+              <option key={p} value={p}>
+                {PROVIDER_INFO[p].label}
+              </option>
+            ))}
           </select>
 
-          {provider === 'ollama' ? (
+          {provider === 'ollama' && (
             <select
               value={ollamaModel}
               onChange={(e) => setOllamaModel(e.target.value)}
               title="Installed Ollama models (ollama pull <model> to add more)"
-              className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
+              className={selectCls}
             >
               {ollamaOptions.map((m) => (
                 <option key={m} value={m}>
@@ -290,12 +395,10 @@ export default function App() {
                 </option>
               ))}
             </select>
-          ) : (
-            <select
-              value={geminiModel}
-              onChange={(e) => setGeminiModel(e.target.value)}
-              className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
-            >
+          )}
+
+          {provider === 'gemini' && (
+            <select value={geminiModel} onChange={(e) => setGeminiModel(e.target.value)} className={selectCls}>
               {geminiOptions.map((m) => (
                 <option key={m} value={m}>
                   {GEMINI_LABELS[m] ?? m}
@@ -304,15 +407,58 @@ export default function App() {
             </select>
           )}
 
-          {provider === 'gemini' && (
+          {provider === 'openrouter' && (
+            <select
+              value={openrouterModel}
+              onChange={(e) => setOpenrouterModel(e.target.value)}
+              title="Live list of OpenRouter's free models that accept images"
+              className={selectCls}
+            >
+              {openrouterModels === null && <option value={openrouterModel}>Loading free models…</option>}
+              {openrouterModels !== null &&
+                openrouterOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id}
+                    {m.json_mode ? '' : ' (no JSON mode)'}
+                  </option>
+                ))}
+            </select>
+          )}
+
+          {provider === 'cloudflare' && (
+            <>
+              <select value={cloudflareModel} onChange={(e) => setCloudflareModel(e.target.value)} className={selectCls}>
+                {cloudflareOptions.map((m) => (
+                  <option key={m} value={m}>
+                    {m.replace(/^@cf\//, '')}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={cfAccountId}
+                onChange={(e) => setCfAccountId(e.target.value)}
+                placeholder="Cloudflare account ID"
+                autoComplete="off"
+                spellCheck={false}
+                title="32-character account ID from the Cloudflare dashboard. Kept in this tab's sessionStorage only."
+                className={inputCls}
+              />
+            </>
+          )}
+
+          {provider !== 'ollama' && (
             <input
               type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Gemini API Key"
+              value={keys[provider]}
+              onChange={(e) => {
+                const value = e.target.value;
+                setKeys((k) => ({ ...k, [provider]: value }));
+              }}
+              placeholder={PROVIDER_INFO[provider].keyLabel}
               autoComplete="off"
-              title="Kept in this browser tab's sessionStorage only. Only 1440x540 contact sheets are sent to Gemini."
-              className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 w-44"
+              title={`${PROVIDER_INFO[provider].keyHelp}. Kept in this browser tab's sessionStorage only. Only 1440x540 contact sheets are sent to the provider — never the raw video.`}
+              className={inputCls}
             />
           )}
 

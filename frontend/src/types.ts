@@ -1,6 +1,7 @@
 // Mirrors the FastAPI JSON responses in backend/main.py.
 
-export type Provider = 'ollama' | 'gemini';
+export type Provider = 'ollama' | 'gemini' | 'openrouter' | 'cloudflare';
+export type CloudProvider = Exclude<Provider, 'ollama'>;
 
 /** ROI vertex in the UI's normalized 0–1000 coordinate space. */
 export interface Point {
@@ -40,6 +41,9 @@ export interface SearchRequest {
   api_key?: string | null;
   ollama_model?: string;
   gemini_model?: string;
+  openrouter_model?: string;
+  cloudflare_model?: string;
+  cloudflare_account_id?: string | null;
 }
 
 export interface SearchResponse {
@@ -54,4 +58,19 @@ export interface HealthResponse {
   default_ollama_model: string;
   gemini_models: string[];
   default_gemini_model: string;
+  default_openrouter_model: string;
+  cloudflare_models: string[];
+  default_cloudflare_model: string;
+}
+
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  context_length: number | null;
+  json_mode: boolean;
+}
+
+export interface OpenRouterModelsResponse {
+  models: OpenRouterModel[];
+  default: string;
 }

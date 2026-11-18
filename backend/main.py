@@ -1,6 +1,7 @@
 """LocalSight FastAPI server: ingest, index, search and stream local CCTV footage."""
 import asyncio
 import json
+import time
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -27,13 +28,20 @@ from ingest import (
     probe_video,
 )
 from vlm_client import (
+    CLOUDFLARE_MODELS,
+    DEFAULT_CLOUDFLARE_MODEL,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OPENROUTER_MODEL,
     GEMINI_MODELS,
     OLLAMA_TAGS_URL,
+    OPENROUTER_MODELS_URL,
     EventSearchResult,
+    analyze_contact_sheet_cloudflare,
     analyze_contact_sheet_gemini,
     analyze_contact_sheet_ollama,
+    analyze_contact_sheet_openrouter,
+    filter_free_vision_models,
 )
 
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".dav", ".mov", ".avi", ".m4v", ".h264", ".h265", ".264", ".265"}
@@ -64,14 +72,29 @@ class ReindexRequest(BaseModel):
     roi: list[RoiPoint] | None = None
 
 
+Provider = Literal["ollama", "gemini", "openrouter", "cloudflare"]
+CLOUD_PROVIDERS: dict[str, str] = {
+    "gemini": "Gemini",
+    "openrouter": "OpenRouter",
+    "cloudflare": "Cloudflare Workers AI",
+}
+# Concurrent contact sheets per provider. Ollama serves one at a time on laptops; free cloud
+# tiers rate-limit bursts (OpenRouter free models ~20 req/min).
+CONCURRENCY: dict[str, int] = {"ollama": 1, "gemini": 10, "openrouter": 2, "cloudflare": 4}
+
+
 class SearchRequest(BaseModel):
     video_id: str
     query: str = Field(min_length=1, max_length=500)
-    provider: Literal["ollama", "gemini"] = "ollama"
-    api_key: str | None = None
+    provider: Provider = "ollama"
+    api_key: str | None = Field(default=None, max_length=500)
     ollama_model: str = Field(default=DEFAULT_OLLAMA_MODEL, pattern=r"^[A-Za-z0-9._:/-]{1,100}$")
     # Interpolated into the Gemini URL path, so restrict to model-ID characters.
     gemini_model: str = Field(default=DEFAULT_GEMINI_MODEL, pattern=r"^gemini-[a-z0-9.-]{1,60}$")
+    openrouter_model: str = Field(default=DEFAULT_OPENROUTER_MODEL, pattern=r"^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]{1,120}$")
+    cloudflare_model: str = Field(default=DEFAULT_CLOUDFLARE_MODEL, pattern=r"^@cf/[A-Za-z0-9._-]+/[A-Za-z0-9._-]{1,120}$")
+    # Interpolated into the Cloudflare URL path: Cloudflare account IDs are 32 hex chars.
+    cloudflare_account_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
 
 
 # ---------- helpers ----------
@@ -190,7 +213,31 @@ async def health_check():
         "default_ollama_model": DEFAULT_OLLAMA_MODEL,
         "gemini_models": list(GEMINI_MODELS),
         "default_gemini_model": DEFAULT_GEMINI_MODEL,
+        "default_openrouter_model": DEFAULT_OPENROUTER_MODEL,
+        "cloudflare_models": list(CLOUDFLARE_MODELS),
+        "default_cloudflare_model": DEFAULT_CLOUDFLARE_MODEL,
     }
+
+
+_OPENROUTER_CACHE: dict = {"at": 0.0, "models": []}
+OPENROUTER_CACHE_TTL_SEC = 600
+
+
+@app.get("/api/openrouter/models")
+async def openrouter_free_vision_models():
+    """Live list of OpenRouter's free, image-capable models (public endpoint, no key or user data sent)."""
+    now = time.monotonic()
+    if _OPENROUTER_CACHE["models"] and now - _OPENROUTER_CACHE["at"] < OPENROUTER_CACHE_TTL_SEC:
+        return {"models": _OPENROUTER_CACHE["models"], "default": DEFAULT_OPENROUTER_MODEL}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(OPENROUTER_MODELS_URL)
+            r.raise_for_status()
+            models = filter_free_vision_models(r.json().get("data", []))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load OpenRouter model list: {type(exc).__name__}") from exc
+    _OPENROUTER_CACHE.update(at=now, models=models)
+    return {"models": models, "default": DEFAULT_OPENROUTER_MODEL}
 
 
 @app.post("/api/index")
@@ -248,17 +295,19 @@ async def get_video(video_id: str):
 @app.post("/api/search")
 async def search_events(req: SearchRequest):
     _require_video(req.video_id)
-    if req.provider == "gemini" and not req.api_key:
-        raise HTTPException(status_code=400, detail="Gemini API key is required for cloud BYOK mode.")
+    if req.provider in CLOUD_PROVIDERS and not req.api_key:
+        label = CLOUD_PROVIDERS[req.provider]
+        what = "API token" if req.provider == "cloudflare" else "API key"
+        raise HTTPException(status_code=400, detail=f"{label} {what} is required for cloud BYOK mode.")
+    if req.provider == "cloudflare" and not req.cloudflare_account_id:
+        raise HTTPException(status_code=400, detail="Cloudflare account ID is required (32-character hex ID from the dashboard).")
 
     events = db.list_events(req.video_id)
     if not events:
         return {"results": []}
     if req.provider == "ollama":
         await check_ollama_ready(req.ollama_model)
-    # Local Ollama serves one request at a time on typical laptops; queuing more just burns
-    # each request's timeout while it waits. Gemini parallelizes fine.
-    semaphore = asyncio.Semaphore(1 if req.provider == "ollama" else 10)
+    semaphore = asyncio.Semaphore(CONCURRENCY[req.provider])
 
     def _safe_error(exc: Exception) -> str:
         msg = f"{type(exc).__name__}: {exc}"
@@ -269,9 +318,19 @@ async def search_events(req: SearchRequest):
     async def evaluate_event(ev: VideoEvent) -> dict:
         async with semaphore:
             try:
+                res: EventSearchResult
                 if req.provider == "gemini":
-                    res: EventSearchResult = await analyze_contact_sheet_gemini(
+                    res = await analyze_contact_sheet_gemini(
                         ev.contact_sheet_path, req.query, req.api_key, model=req.gemini_model
+                    )
+                elif req.provider == "openrouter":
+                    res = await analyze_contact_sheet_openrouter(
+                        ev.contact_sheet_path, req.query, req.api_key, model=req.openrouter_model
+                    )
+                elif req.provider == "cloudflare":
+                    res = await analyze_contact_sheet_cloudflare(
+                        ev.contact_sheet_path, req.query, req.api_key, req.cloudflare_account_id,
+                        model=req.cloudflare_model,
                     )
                 else:
                     res = await analyze_contact_sheet_ollama(

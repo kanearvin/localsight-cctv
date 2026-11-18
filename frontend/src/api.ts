@@ -1,6 +1,7 @@
 import type {
   HealthResponse,
   IndexResponse,
+  OpenRouterModelsResponse,
   Point,
   SearchRequest,
   SearchResponse,
@@ -68,3 +69,5 @@ export const searchEvents = (req: SearchRequest) =>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
   });
+
+export const getOpenRouterModels = () => request<OpenRouterModelsResponse>('/api/openrouter/models');
