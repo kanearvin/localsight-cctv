@@ -1,5 +1,7 @@
 # LocalSight CCTV Scrubber
 
+[![CI](https://github.com/kanearvin/localsight-cctv/actions/workflows/ci.yml/badge.svg)](https://github.com/kanearvin/localsight-cctv/actions/workflows/ci.yml)
+
 Privacy-first, local-first search for exported home CCTV footage (`.mp4`, `.mkv`, `.dav`).
 LocalSight remuxes the file to browser-playable H.264, drops static frames with OpenCV motion
 detection (optionally masked to a zone you draw), groups motion into events, and lets you ask
@@ -73,3 +75,24 @@ cd backend && source .venv/bin/activate && pytest -v   # synthetic-video pipelin
 cd frontend && npm run build                            # must exit 0
 ```
 Set `LOCALSIGHT_WORKSPACE=/some/dir` to store data somewhere other than `./workspace`.
+
+## CI/CD
+- **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR: backend `pytest`
+  on Python 3.11 and 3.14 with FFmpeg installed (FFmpeg tests are required, never skipped), and
+  frontend `npm ci && npm run build` on Node 22.
+- **Release** (`.github/workflows/release.yml`): pushing a `vX.Y.Z` tag re-runs CI, then publishes a
+  GitHub Release with a self-contained bundle (backend + prebuilt frontend) and SHA-256 checksums.
+  Tags with a hyphen (e.g. `v1.0.0-rc.1`) are marked as pre-releases. There is no cloud deploy —
+  LocalSight runs on the user's machine.
+  ```bash
+  git tag v1.0.0 && git push origin v1.0.0
+  ```
+- **Dependabot** opens weekly update PRs for pip, npm and GitHub Actions.
+
+### Running a release bundle (single command)
+When `frontend/dist` exists, the backend serves the UI itself, so no Node is needed:
+```bash
+tar -xzf localsight-cctv-v1.0.0.tar.gz && cd localsight-cctv-v1.0.0/backend
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000   # open http://127.0.0.1:8000
+```

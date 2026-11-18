@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,9 @@ ROI_PIXELS = [(80, 80), (280, 80), (280, 280), (80, 280)]
 ROI_NORMALIZED = [{"x": round(x * 1000 / (WIDTH - 1), 1), "y": round(y * 1000 / (HEIGHT - 1), 1)} for x, y in ROI_PIXELS]
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+# CI sets this so FFmpeg-dependent tests fail loudly instead of silently skipping.
+if os.environ.get("LOCALSIGHT_REQUIRE_FFMPEG") == "1" and not HAS_FFMPEG:
+    raise RuntimeError("LOCALSIGHT_REQUIRE_FFMPEG=1 but ffmpeg/ffprobe are not on PATH")
 requires_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg/ffprobe not on PATH")
 
 

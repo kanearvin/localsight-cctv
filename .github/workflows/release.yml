@@ -1,0 +1,57 @@
+name: Release
+
+# LocalSight is local-first: there is no server to deploy to. "CD" = publish a
+# self-contained bundle (backend + prebuilt frontend) users download and run on
+# their own machine. Trigger by pushing a tag, e.g. `git tag v1.0.0 && git push origin v1.0.0`.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: Package & publish release
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Assemble bundle
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NAME="localsight-cctv-${TAG}"
+          mkdir -p "dist/${NAME}/frontend"
+          rsync -a --exclude tests --exclude '__pycache__' --exclude pytest.ini backend/ "dist/${NAME}/backend/"
+          cp -r frontend/dist "dist/${NAME}/frontend/dist"
+          cp README.md "dist/${NAME}/"
+          test -f "dist/${NAME}/frontend/dist/index.html"
+          cd dist
+          tar -czf "${NAME}.tar.gz" "${NAME}"
+          zip -qr "${NAME}.zip" "${NAME}"
+          sha256sum "${NAME}.tar.gz" "${NAME}.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
