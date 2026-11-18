@@ -24,7 +24,13 @@ from ingest import (
     parse_timestamp,
     probe_video,
 )
-from vlm_client import EventSearchResult, analyze_contact_sheet_gemini, analyze_contact_sheet_ollama
+from vlm_client import (
+    DEFAULT_OLLAMA_MODEL,
+    OLLAMA_TAGS_URL,
+    EventSearchResult,
+    analyze_contact_sheet_gemini,
+    analyze_contact_sheet_ollama,
+)
 
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".dav", ".mov", ".avi", ".m4v", ".h264", ".h265", ".264", ".265"}
 
@@ -59,7 +65,7 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     provider: Literal["ollama", "gemini"] = "ollama"
     api_key: str | None = None
-    ollama_model: str = "qwen2.5-vl:7b"
+    ollama_model: str = DEFAULT_OLLAMA_MODEL
 
 
 # ---------- helpers ----------
@@ -125,6 +131,29 @@ def _save_upload(file: UploadFile, dest: Path) -> None:
         shutil.copyfileobj(file.file, buffer, length=8 * 1024 * 1024)
 
 
+async def check_ollama_ready(model: str) -> None:
+    """Fail fast with an actionable 503 instead of N identical per-event connection errors."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(OLLAMA_TAGS_URL)
+            r.raise_for_status()
+            installed = {m.get("name", "") for m in r.json().get("models", [])}
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Ollama is not running at localhost:11434. Install it (https://ollama.com or "
+                f"`brew install ollama`), start it with `ollama serve`, run `ollama pull {model}`, "
+                "or switch to Cloud BYOK (Gemini)."
+            ),
+        )
+    if model not in installed and f"{model}:latest" not in installed:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama is running but model '{model}' is not installed. Run `ollama pull {model}`.",
+        )
+
+
 def _require_video(video_id: str) -> dict:
     record = db.get_video(video_id)
     if not record:
@@ -140,7 +169,7 @@ async def health_check():
     ollama_ok = False
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get("http://localhost:11434/api/tags")
+            r = await client.get(OLLAMA_TAGS_URL)
             ollama_ok = r.status_code == 200
     except Exception:
         ollama_ok = False
@@ -206,6 +235,10 @@ async def search_events(req: SearchRequest):
         raise HTTPException(status_code=400, detail="Gemini API key is required for cloud BYOK mode.")
 
     events = db.list_events(req.video_id)
+    if not events:
+        return {"results": []}
+    if req.provider == "ollama":
+        await check_ollama_ready(req.ollama_model)
     semaphore = asyncio.Semaphore(4 if req.provider == "ollama" else 10)
 
     def _safe_error(exc: Exception) -> str:

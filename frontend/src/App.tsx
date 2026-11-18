@@ -187,6 +187,10 @@ export default function App() {
       });
       setEvents(data.results);
       setSearched(true);
+      const failed = data.results.filter((r) => r.tags.includes('error'));
+      if (data.results.length > 0 && failed.length === data.results.length) {
+        setError(`Search failed for every event — ${failed[0].summary.replace(/^Evaluation error:\s*/, '')}`);
+      }
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -206,7 +210,8 @@ export default function App() {
   // ---- derived ----
   const polygonString = roiPoints.map((p) => `${p.x},${p.y}`).join(' ');
   const matched = events.filter((ev) => ev.matched);
-  const errored = events.filter((ev) => ev.tags.includes('error')).length;
+  const failedEvents = events.filter((ev) => ev.tags.includes('error'));
+  const errored = failedEvents.length;
   const effectiveRoi = roiPoints.length >= 3 ? roiPoints : [];
   const roiDirty = JSON.stringify(effectiveRoi) !== JSON.stringify(appliedRoi);
   const isBusy = busy !== null;
@@ -231,7 +236,7 @@ export default function App() {
             onChange={(e) => setProvider(e.target.value as Provider)}
             className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
           >
-            <option value="ollama">Offline Ollama (qwen2.5-vl:7b)</option>
+            <option value="ollama">Offline Ollama (qwen2.5vl:7b)</option>
             <option value="gemini">Cloud BYOK (Gemini 2.5 Flash)</option>
           </select>
 
@@ -444,10 +449,28 @@ export default function App() {
               <span>Click card to jump</span>
             </div>
 
-            {videoId && matched.length === 0 && !isBusy && (
+            {videoId && matched.length === 0 && errored === 0 && !isBusy && (
               <p className="text-sm text-slate-500 py-6 text-center">
                 {searched ? 'No events matched that query.' : 'No motion detected in this clip.'}
               </p>
+            )}
+
+            {searched && errored > 0 && (
+              <details className="rounded-xl border border-amber-900/60 bg-amber-950/20 p-3 text-xs text-amber-300">
+                <summary className="cursor-pointer select-none">
+                  {errored} event{errored === 1 ? '' : 's'} could not be evaluated — show details
+                </summary>
+                <ul className="mt-2 space-y-1 text-amber-200/80">
+                  {failedEvents.map((ev) => (
+                    <li key={ev.id}>
+                      <button type="button" onClick={() => jumpToTimestamp(ev)} className="font-mono text-amber-300 hover:underline">
+                        {ev.timestampStr}
+                      </button>{' '}
+                      {ev.summary.replace(/^Evaluation error:\s*/, '')}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
 
             {matched.map((ev) => (

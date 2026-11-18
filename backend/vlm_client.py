@@ -7,6 +7,9 @@ import httpx
 from pydantic import BaseModel, Field, field_validator
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+# Ollama library tag (no hyphen): https://ollama.com/library/qwen2.5vl
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
@@ -59,7 +62,7 @@ def _user_text(user_query: str) -> str:
 async def analyze_contact_sheet_ollama(
     image_path: str,
     user_query: str,
-    model: str = "qwen2.5-vl:7b",
+    model: str = DEFAULT_OLLAMA_MODEL,
     ollama_url: str = OLLAMA_CHAT_URL,
     client: httpx.AsyncClient | None = None,
 ) -> EventSearchResult:

@@ -158,6 +158,10 @@ def test_remux_failure_raises_clear_error(tmp_path):
 
 # ---------------------------------------------------------------- API
 
+async def _ollama_ready(model: str) -> None:
+    return None
+
+
 def _index(client: TestClient, video: Path, roi=None):
     data = {"roi_json": json.dumps(roi)} if roi else {}
     with video.open("rb") as fh:
@@ -230,7 +234,7 @@ def test_search_ranks_and_isolates_failures(client, synthetic_video, monkeypatch
     vid = _index(client, synthetic_video).json()["video_id"]
     calls: list[str] = []
 
-    async def fake_ollama(image_path, user_query, model="qwen2.5-vl:7b", **_):
+    async def fake_ollama(image_path, user_query, model="qwen2.5vl:7b", **_):
         calls.append(image_path)
         if image_path.endswith("event_001.jpg"):
             raise ValueError("malformed JSON from model")
@@ -240,6 +244,7 @@ def test_search_ranks_and_isolates_failures(client, synthetic_video, monkeypatch
         )
 
     monkeypatch.setattr(main, "analyze_contact_sheet_ollama", fake_ollama)
+    monkeypatch.setattr(main, "check_ollama_ready", _ollama_ready)
     r = client.post("/api/search", json={"video_id": vid, "query": "white box", "provider": "ollama"})
     assert r.status_code == 200, r.text
     results = r.json()["results"]
@@ -267,6 +272,36 @@ def test_search_gemini_requires_key_and_redacts_it(client, synthetic_video, monk
     assert all(res["matched"] is False for res in r.json()["results"])
 
 
+@requires_ffmpeg
+def test_search_ollama_unreachable_returns_actionable_503(client, synthetic_video, monkeypatch):
+    vid = _index(client, synthetic_video).json()["video_id"]
+    monkeypatch.setattr(main, "OLLAMA_TAGS_URL", "http://127.0.0.1:9/api/tags")  # nothing listens here
+    r = client.post("/api/search", json={"video_id": vid, "query": "person", "provider": "ollama"})
+    assert r.status_code == 503
+    assert "ollama serve" in r.json()["detail"] and "qwen2.5vl:7b" in r.json()["detail"]
+
+
+@requires_ffmpeg
+def test_search_ollama_model_missing_returns_503(client, synthetic_video, monkeypatch):
+    vid = _index(client, synthetic_video).json()["video_id"]
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"models": [{"name": "llama3:latest"}]})
+        )
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", fake_client)
+    r = client.post("/api/search", json={"video_id": vid, "query": "person", "provider": "ollama"})
+    assert r.status_code == 503
+    assert "ollama pull qwen2.5vl:7b" in r.json()["detail"]
+
+
+def test_default_ollama_model_is_valid_library_tag():
+    assert main.SearchRequest(video_id="v", query="q").ollama_model == "qwen2.5vl:7b"
+
+
 def test_search_unknown_video_404(client):
     r = client.post("/api/search", json={"video_id": "nope", "query": "x", "provider": "ollama"})
     assert r.status_code == 404
@@ -281,6 +316,7 @@ def test_persistence_across_restart(workspace, synthetic_video, monkeypatch):
         return EventSearchResult(matched=False, confidence=0.1, best_timestamp="", summary="nothing", tags=[])
 
     monkeypatch.setattr(main, "analyze_contact_sheet_ollama", fake_ollama)
+    monkeypatch.setattr(main, "check_ollama_ready", _ollama_ready)
     with TestClient(main.app) as c2:  # fresh app lifespan, same on-disk SQLite
         r = c2.get(f"/api/videos/{vid}")
         assert r.status_code == 200 and r.json()["event_count"] == 2

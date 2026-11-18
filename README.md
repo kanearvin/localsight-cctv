@@ -35,11 +35,12 @@ marker) to jump the player to that moment.
 
 ### Offline — Ollama (100% local, default)
 ```bash
-# install from https://ollama.com, then:
-ollama pull qwen2.5-vl:7b
-ollama serve            # listens on http://localhost:11434
+brew install ollama          # or the desktop app from https://ollama.com
+ollama serve                 # keep running; listens on http://localhost:11434
+ollama pull qwen2.5vl:7b     # in another terminal, ~6 GB one-time download
 ```
 Select **Offline Ollama** in the header. The header badge turns green when Ollama is reachable.
+If Ollama isn't running or the model isn't pulled, **Find** shows an error explaining what to run.
 
 ### Cloud BYOK — Gemini 2.5 Flash
 Select **Cloud BYOK** and paste your own Gemini API key. The key lives only in this browser tab's
