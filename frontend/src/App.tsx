@@ -20,6 +20,16 @@ import type { HealthResponse, IndexResponse, Point, Provider, SecurityEvent } fr
 
 const GEMINI_KEY_STORAGE = 'localsight.geminiKey'; // sessionStorage only — never persisted to disk/backend
 const LAST_VIDEO_STORAGE = 'localsight.lastVideoId';
+const OLLAMA_MODEL_STORAGE = 'localsight.ollamaModel';
+const GEMINI_MODEL_STORAGE = 'localsight.geminiModel';
+
+// Fallbacks used until /api/health responds; the backend is the source of truth.
+const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
+const FALLBACK_GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
+const GEMINI_LABELS: Record<string, string> = {
+  'gemini-3.5-flash-lite': 'Gemini 3.5 Flash-Lite (fast, low cost)',
+  'gemini-4-hydrogen': 'Gemini 4 Hydrogen (more capable)',
+};
 
 interface ContentBox {
   left: number;
@@ -49,6 +59,12 @@ export default function App() {
   const [appliedRoi, setAppliedRoi] = useState<Point[]>([]);
   const [query, setQuery] = useState<string>('');
   const [provider, setProvider] = useState<Provider>('ollama');
+  const [ollamaModel, setOllamaModel] = useState<string>(
+    () => safeStorage('local')?.getItem(OLLAMA_MODEL_STORAGE) ?? DEFAULT_OLLAMA_MODEL,
+  );
+  const [geminiModel, setGeminiModel] = useState<string>(
+    () => safeStorage('local')?.getItem(GEMINI_MODEL_STORAGE) ?? FALLBACK_GEMINI_MODELS[0],
+  );
   const [apiKey, setApiKey] = useState<string>(() => safeStorage('session')?.getItem(GEMINI_KEY_STORAGE) ?? '');
   const [busy, setBusy] = useState<null | 'indexing' | 'rescanning' | 'searching'>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +80,13 @@ export default function App() {
 
   // ---- health + restore last session ----
   useEffect(() => {
-    getHealth().then(setHealth).catch(() => setHealth(null));
+    getHealth()
+      .then((h) => {
+        setHealth(h);
+        // Drop a remembered Gemini model the backend no longer offers (e.g. a retired ID).
+        setGeminiModel((m) => (h.gemini_models.includes(m) ? m : h.default_gemini_model));
+      })
+      .catch(() => setHealth(null));
     const lastId = safeStorage('local')?.getItem(LAST_VIDEO_STORAGE);
     if (lastId) {
       getVideo(lastId)
@@ -80,6 +102,15 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    try {
+      safeStorage('local')?.setItem(OLLAMA_MODEL_STORAGE, ollamaModel);
+      safeStorage('local')?.setItem(GEMINI_MODEL_STORAGE, geminiModel);
+    } catch {
+      /* storage unavailable — model choice just won't be remembered */
+    }
+  }, [ollamaModel, geminiModel]);
 
   useEffect(() => {
     const store = safeStorage('session');
@@ -184,6 +215,8 @@ export default function App() {
         query: query.trim(),
         provider,
         api_key: provider === 'gemini' ? apiKey.trim() : null,
+        ollama_model: ollamaModel,
+        gemini_model: geminiModel,
       });
       setEvents(data.results);
       setSearched(true);
@@ -215,6 +248,9 @@ export default function App() {
   const effectiveRoi = roiPoints.length >= 3 ? roiPoints : [];
   const roiDirty = JSON.stringify(effectiveRoi) !== JSON.stringify(appliedRoi);
   const isBusy = busy !== null;
+  const installedOllama = health?.ollama_models ?? [];
+  const ollamaOptions = Array.from(new Set([DEFAULT_OLLAMA_MODEL, ...installedOllama, ollamaModel]));
+  const geminiOptions = Array.from(new Set([...(health?.gemini_models ?? FALLBACK_GEMINI_MODELS), geminiModel]));
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6 font-sans">
@@ -236,9 +272,37 @@ export default function App() {
             onChange={(e) => setProvider(e.target.value as Provider)}
             className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
           >
-            <option value="ollama">Offline Ollama (qwen2.5vl:7b)</option>
-            <option value="gemini">Cloud BYOK (Gemini 2.5 Flash)</option>
+            <option value="ollama">Offline Ollama</option>
+            <option value="gemini">Cloud BYOK (Gemini)</option>
           </select>
+
+          {provider === 'ollama' ? (
+            <select
+              value={ollamaModel}
+              onChange={(e) => setOllamaModel(e.target.value)}
+              title="Installed Ollama models (ollama pull <model> to add more)"
+              className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
+            >
+              {ollamaOptions.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                  {installedOllama.length > 0 && !installedOllama.includes(m) ? ' (not pulled)' : ''}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <select
+              value={geminiModel}
+              onChange={(e) => setGeminiModel(e.target.value)}
+              className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
+            >
+              {geminiOptions.map((m) => (
+                <option key={m} value={m}>
+                  {GEMINI_LABELS[m] ?? m}
+                </option>
+              ))}
+            </select>
+          )}
 
           {provider === 'gemini' && (
             <input

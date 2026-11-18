@@ -27,7 +27,9 @@ from ingest import (
     probe_video,
 )
 from vlm_client import (
+    DEFAULT_GEMINI_MODEL,
     DEFAULT_OLLAMA_MODEL,
+    GEMINI_MODELS,
     OLLAMA_TAGS_URL,
     EventSearchResult,
     analyze_contact_sheet_gemini,
@@ -67,7 +69,9 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     provider: Literal["ollama", "gemini"] = "ollama"
     api_key: str | None = None
-    ollama_model: str = DEFAULT_OLLAMA_MODEL
+    ollama_model: str = Field(default=DEFAULT_OLLAMA_MODEL, pattern=r"^[A-Za-z0-9._:/-]{1,100}$")
+    # Interpolated into the Gemini URL path, so restrict to model-ID characters.
+    gemini_model: str = Field(default=DEFAULT_GEMINI_MODEL, pattern=r"^gemini-[a-z0-9.-]{1,60}$")
 
 
 # ---------- helpers ----------
@@ -169,13 +173,24 @@ def _require_video(video_id: str) -> dict:
 async def health_check():
     ffmpeg_ok = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
     ollama_ok = False
+    ollama_models: list[str] = []
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             r = await client.get(OLLAMA_TAGS_URL)
             ollama_ok = r.status_code == 200
+            if ollama_ok:
+                ollama_models = sorted(m.get("name", "") for m in r.json().get("models", []) if m.get("name"))
     except Exception:
         ollama_ok = False
-    return {"status": "ok", "ffmpeg": ffmpeg_ok, "ollama_reachable": ollama_ok}
+    return {
+        "status": "ok",
+        "ffmpeg": ffmpeg_ok,
+        "ollama_reachable": ollama_ok,
+        "ollama_models": ollama_models,
+        "default_ollama_model": DEFAULT_OLLAMA_MODEL,
+        "gemini_models": list(GEMINI_MODELS),
+        "default_gemini_model": DEFAULT_GEMINI_MODEL,
+    }
 
 
 @app.post("/api/index")
@@ -241,7 +256,9 @@ async def search_events(req: SearchRequest):
         return {"results": []}
     if req.provider == "ollama":
         await check_ollama_ready(req.ollama_model)
-    semaphore = asyncio.Semaphore(4 if req.provider == "ollama" else 10)
+    # Local Ollama serves one request at a time on typical laptops; queuing more just burns
+    # each request's timeout while it waits. Gemini parallelizes fine.
+    semaphore = asyncio.Semaphore(1 if req.provider == "ollama" else 10)
 
     def _safe_error(exc: Exception) -> str:
         msg = f"{type(exc).__name__}: {exc}"
@@ -254,7 +271,7 @@ async def search_events(req: SearchRequest):
             try:
                 if req.provider == "gemini":
                     res: EventSearchResult = await analyze_contact_sheet_gemini(
-                        ev.contact_sheet_path, req.query, req.api_key
+                        ev.contact_sheet_path, req.query, req.api_key, model=req.gemini_model
                     )
                 else:
                     res = await analyze_contact_sheet_ollama(

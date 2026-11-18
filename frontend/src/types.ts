@@ -39,6 +39,7 @@ export interface SearchRequest {
   provider: Provider;
   api_key?: string | null;
   ollama_model?: string;
+  gemini_model?: string;
 }
 
 export interface SearchResponse {
@@ -49,4 +50,8 @@ export interface HealthResponse {
   status: 'ok';
   ffmpeg: boolean;
   ollama_reachable: boolean;
+  ollama_models: string[];
+  default_ollama_model: string;
+  gemini_models: string[];
+  default_gemini_model: string;
 }

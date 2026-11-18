@@ -39,13 +39,20 @@ marker) to jump the player to that moment.
 ```bash
 brew install ollama          # or the desktop app from https://ollama.com
 ollama serve                 # keep running; listens on http://localhost:11434
-ollama pull qwen2.5vl:7b     # in another terminal, ~6 GB one-time download
+ollama pull qwen2.5vl:3b     # in another terminal, ~3 GB one-time download (default)
+# Optional, needs ≥16 GB RAM to run at usable speed: ollama pull qwen2.5vl:7b
 ```
 Select **Offline Ollama** in the header. The header badge turns green when Ollama is reachable.
 If Ollama isn't running or the model isn't pulled, **Find** shows an error explaining what to run.
 
-### Cloud BYOK — Gemini 2.5 Flash
-Select **Cloud BYOK** and paste your own Gemini API key. The key lives only in this browser tab's
+Pick the model from the dropdown next to the provider (it lists everything you've pulled). Local
+inference is sequential and each contact sheet may take a while on CPU; the per-sheet timeout is
+300 s and can be changed with `LOCALSIGHT_OLLAMA_TIMEOUT=<seconds>`.
+
+### Cloud BYOK — Gemini
+Select **Cloud BYOK**, choose a model — **Gemini 3.5 Flash-Lite** (default, fastest/cheapest) or
+**Gemini 4 Hydrogen** (more capable) — and paste your own Gemini API key. (`gemini-2.5-flash` is
+deprecated by Google and returns 404 for new keys.) The key lives only in this browser tab's
 `sessionStorage` (cleared when the tab closes) and is never written to the backend's disk.
 Only the compressed 1440×540 2×3 contact-sheet JPEGs are sent to Google — never the raw video.
 
@@ -55,7 +62,7 @@ Only the compressed 1440×540 2×3 contact-sheet JPEGs are sent to Google — ne
    and keep frames whose changed-pixel ratio ≥ 0.8%.
 2. `events.py` — cluster motion frames with a 4 s gap tolerance and render a 2×3 timestamp-burned
    contact sheet per event.
-3. `vlm_client.py` — send each sheet + your query to Ollama or Gemini concurrently; malformed
+3. `vlm_client.py` — send each sheet + your query to Ollama (one at a time) or Gemini (concurrently); malformed
    replies or timeouts mark only that event as failed.
 4. `db.py` — videos, ROI and events persist in `workspace/localsight.db`, so indexes survive restarts.
 

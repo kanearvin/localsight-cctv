@@ -171,7 +171,11 @@ def _index(client: TestClient, video: Path, roi=None):
 def test_health(client):
     body = client.get("/api/health").json()
     assert body["status"] == "ok"
-    assert set(body) == {"status", "ffmpeg", "ollama_reachable"}
+    assert set(body) >= {"status", "ffmpeg", "ollama_reachable", "ollama_models", "gemini_models"}
+    assert body["default_ollama_model"] == "qwen2.5vl:3b"
+    assert body["default_gemini_model"] == "gemini-3.5-flash-lite"
+    assert "gemini-4-hydrogen" in body["gemini_models"]
+    assert "gemini-2.5-flash" not in body["gemini_models"]
     assert isinstance(body["ollama_reachable"], bool)
     assert body["ffmpeg"] is HAS_FFMPEG
 
@@ -234,7 +238,7 @@ def test_search_ranks_and_isolates_failures(client, synthetic_video, monkeypatch
     vid = _index(client, synthetic_video).json()["video_id"]
     calls: list[str] = []
 
-    async def fake_ollama(image_path, user_query, model="qwen2.5vl:7b", **_):
+    async def fake_ollama(image_path, user_query, model="qwen2.5vl:3b", **_):
         calls.append(image_path)
         if image_path.endswith("event_001.jpg"):
             raise ValueError("malformed JSON from model")
@@ -278,7 +282,7 @@ def test_search_ollama_unreachable_returns_actionable_503(client, synthetic_vide
     monkeypatch.setattr(main, "OLLAMA_TAGS_URL", "http://127.0.0.1:9/api/tags")  # nothing listens here
     r = client.post("/api/search", json={"video_id": vid, "query": "person", "provider": "ollama"})
     assert r.status_code == 503
-    assert "ollama serve" in r.json()["detail"] and "qwen2.5vl:7b" in r.json()["detail"]
+    assert "ollama serve" in r.json()["detail"] and "qwen2.5vl:3b" in r.json()["detail"]
 
 
 @requires_ffmpeg
@@ -295,11 +299,11 @@ def test_search_ollama_model_missing_returns_503(client, synthetic_video, monkey
     monkeypatch.setattr(main.httpx, "AsyncClient", fake_client)
     r = client.post("/api/search", json={"video_id": vid, "query": "person", "provider": "ollama"})
     assert r.status_code == 503
-    assert "ollama pull qwen2.5vl:7b" in r.json()["detail"]
+    assert "ollama pull qwen2.5vl:3b" in r.json()["detail"]
 
 
 def test_default_ollama_model_is_valid_library_tag():
-    assert main.SearchRequest(video_id="v", query="q").ollama_model == "qwen2.5vl:7b"
+    assert main.SearchRequest(video_id="v", query="q").ollama_model == "qwen2.5vl:3b"
 
 
 def test_search_unknown_video_404(client):
@@ -391,7 +395,7 @@ def test_gemini_adapter_sends_key_in_header(tmp_path):
     res = asyncio.run(analyze_contact_sheet_gemini(str(img), "person", "KEY-abc", client=client))
     assert res.confidence == 1.0
     assert seen["key"] == "KEY-abc" and "KEY-abc" not in seen["url"]
-    assert "gemini-2.5-flash:generateContent" in seen["url"]
+    assert "gemini-3.5-flash-lite:generateContent" in seen["url"]
     assert seen["body"]["generationConfig"]["responseMimeType"] == "application/json"
     assert seen["body"]["contents"][0]["parts"][1]["inlineData"]["mimeType"] == "image/jpeg"
 
@@ -416,3 +420,65 @@ def test_mount_frontend_serves_spa_without_shadowing_api(tmp_path):
     with TestClient(app) as c:
         assert "LocalSight" in c.get("/").text
         assert c.get("/api/ping").json() == {"pong": True}
+
+
+# ---------------------------------------------------------------- model selection & provider errors
+
+def test_search_request_model_defaults_and_validation():
+    req = main.SearchRequest(video_id="v", query="q")
+    assert req.gemini_model == "gemini-3.5-flash-lite"
+    assert main.SearchRequest(video_id="v", query="q", gemini_model="gemini-4-hydrogen").gemini_model == "gemini-4-hydrogen"
+    for bad in ["../../evil", "gemini-x/../y", "gpt-4o", "gemini-3.5-flash-lite?key=1"]:
+        with pytest.raises(Exception):
+            main.SearchRequest(video_id="v", query="q", gemini_model=bad)
+
+
+@requires_ffmpeg
+def test_search_passes_selected_gemini_model(client, synthetic_video, monkeypatch):
+    vid = _index(client, synthetic_video).json()["video_id"]
+    seen: list[str] = []
+
+    async def fake_gemini(image_path, user_query, api_key, model="?", **_):
+        seen.append(model)
+        return EventSearchResult(matched=True, confidence=0.5, best_timestamp="", summary="ok", tags=[])
+
+    monkeypatch.setattr(main, "analyze_contact_sheet_gemini", fake_gemini)
+    r = client.post("/api/search", json={"video_id": vid, "query": "car", "provider": "gemini",
+                                         "api_key": "k", "gemini_model": "gemini-4-hydrogen"})
+    assert r.status_code == 200
+    assert seen and set(seen) == {"gemini-4-hydrogen"}
+    bad = client.post("/api/search", json={"video_id": vid, "query": "car", "provider": "gemini",
+                                           "api_key": "k", "gemini_model": "../x"})
+    assert bad.status_code == 422
+
+
+def test_gemini_http_error_surfaces_provider_message(tmp_path):
+    img = tmp_path / "s.jpg"
+    Image.new("RGB", (1440, 540)).save(img)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"code": 404, "message": "models/gemini-2.5-flash is not found", "status": "NOT_FOUND"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(Exception) as exc:
+        asyncio.run(analyze_contact_sheet_gemini(str(img), "x", "KEY", model="gemini-2.5-flash", client=client))
+    msg = str(exc.value)
+    assert "404" in msg and "is not found" in msg and "gemini-2.5-flash" in msg
+    assert "KEY" not in msg
+
+
+def test_ollama_uses_generous_timeout_and_keep_alive(tmp_path):
+    import vlm_client
+
+    assert vlm_client.OLLAMA_TIMEOUT_SEC >= 300
+    img = tmp_path / "s.jpg"
+    Image.new("RGB", (1440, 540)).save(img)
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": VALID_JSON}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    asyncio.run(analyze_contact_sheet_ollama(str(img), "x", client=client))
+    assert seen["body"]["model"] == "qwen2.5vl:3b" and seen["body"]["keep_alive"]
