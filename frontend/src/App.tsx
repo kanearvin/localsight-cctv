@@ -12,6 +12,7 @@ import {
   Sparkles,
   Trash2,
   Undo2,
+  RotateCcw,
   Upload,
   X,
 } from 'lucide-react';
@@ -241,18 +242,40 @@ export default function App() {
   }
 
   // ---- actions ----
+  /** Clear everything tied to the current video. Provider, model and key settings are kept. */
+  const resetWorkspace = () => {
+    videoRef.current?.pause();
+    setVideoId(null);
+    setVideoUrl(null);
+    setFileName('');
+    setRoiMode(false);
+    setRoiPoints([]);
+    setAppliedRoi([]);
+    setQuery('');
+    setEvents([]);
+    setSearched(false);
+    setActiveEventId(null);
+    setDuration(0);
+    setBox(null);
+    setError(null);
+    // Otherwise a browser refresh restores the previous video.
+    safeStorage('local')?.removeItem(LAST_VIDEO_STORAGE);
+  };
+
+  const handleReset = () => {
+    if (busy !== null) return;
+    if (searched && !window.confirm('Clear the current video, detection zone and search results?')) return;
+    resetWorkspace();
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    // Start from a clean slate so a failed upload can't leave the previous video searchable.
+    resetWorkspace();
     setFileName(file.name);
-    setError(null);
     setBusy('indexing');
-    setRoiPoints([]);
-    setAppliedRoi([]);
-    setRoiMode(false);
-    setVideoUrl(null);
-    setBox(null);
     try {
       applyIndexResponse(await indexVideo(file));
     } catch (err) {
@@ -460,6 +483,19 @@ export default function App() {
               title={`${PROVIDER_INFO[provider].keyHelp}. Kept in this browser tab's sessionStorage only. Only 1440x540 contact sheets are sent to the provider — never the raw video.`}
               className={inputCls}
             />
+          )}
+
+          {(videoId || fileName || events.length > 0) && (
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={isBusy}
+              title="Clear the current video, zone and results to start over (settings and keys are kept)"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm font-medium text-slate-200 transition disabled:opacity-50"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>New video</span>
+            </button>
           )}
 
           <label
