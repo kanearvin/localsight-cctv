@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python-headless
+numpy
+pillow
+pydantic>=2.0.0
+httpx
+pytest
